@@ -1,8 +1,9 @@
-import libsql
 import os
 
-url = os.getenv("TURSO_DATABASE_URL")
-auth_token = os.getenv("TURSO_AUTH_TOKEN")
+import libsql
+
+url = os.environ["TURSO_DATABASE_URL"]
+auth_token = os.getenv("TURSO_AUTH_TOKEN", "")
 
 conn = libsql.connect(url, auth_token=auth_token)
 cur = conn.cursor()

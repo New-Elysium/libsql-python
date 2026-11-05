@@ -1,11 +1,11 @@
 [build-system]
-requires = ["maturin>=1.1,<2.0"]
+requires = ["maturin>=1.9.4,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "libsql"
 version = "0.1.11"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -14,5 +14,13 @@ classifiers = [
 
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
 module-name = "libsql"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "UP", "B", "PYI"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["libsql"]

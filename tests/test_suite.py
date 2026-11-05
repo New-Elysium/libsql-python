@@ -2,9 +2,10 @@
 
 import sqlite3
 import sys
-import libsql
+
 import pytest
-import tempfile
+
+import libsql
 
 
 @pytest.mark.parametrize("provider", ["libsql", "sqlite"])
@@ -51,7 +52,7 @@ def test_cursor_close(provider):
     res = cur.execute("SELECT * FROM users")
     assert [(1, "alice@example.com"), (2, "bob@example.com")] == res.fetchall()
     cur.close()
-    with pytest.raises(Exception):
+    with pytest.raises((sqlite3.ProgrammingError, libsql.ProgrammingError)):
         cur.execute("SELECT * FROM users")
 
 
@@ -177,13 +178,13 @@ def test_commit_and_rollback(provider):
 @pytest.mark.parametrize("provider", ["libsql", "sqlite"])
 def test_autocommit(provider):
     conn = connect(provider, ":memory:", timeout=4, isolation_level=None)
-    assert conn.isolation_level == None
-    assert conn.in_transaction == False
+    assert conn.isolation_level is None
+    assert not conn.in_transaction
     cur = conn.cursor()
-    assert conn.in_transaction == False
+    assert not conn.in_transaction
     cur.execute("CREATE TABLE users (id INTEGER, email TEXT)")
     cur.execute("INSERT INTO users VALUES (?, ?)", (1, "alice@example.com"))
-    assert conn.in_transaction == False
+    assert not conn.in_transaction
     res = cur.execute("SELECT * FROM users")
     assert (1, "alice@example.com") == res.fetchone()
     conn.rollback()
@@ -223,8 +224,8 @@ def test_connection_autocommit(provider):
     conn = connect(
         provider, ":memory:", timeout=5, isolation_level=None, autocommit=True
     )
-    assert conn.isolation_level == None
-    assert conn.autocommit == True
+    assert conn.isolation_level is None
+    assert conn.autocommit
     cur = conn.cursor()
     assert conn.in_transaction is False
     cur.execute("CREATE TABLE users (id INTEGER, email TEXT)")
@@ -237,7 +238,7 @@ def test_connection_autocommit(provider):
         provider, ":memory:", timeout=5, isolation_level="DEFERRED", autocommit=True
     )
     assert conn.isolation_level == "DEFERRED"
-    assert conn.autocommit == True
+    assert conn.autocommit
     cur = conn.cursor()
     assert conn.in_transaction is False
     cur.execute("CREATE TABLE users (id INTEGER, email TEXT)")
@@ -251,7 +252,7 @@ def test_connection_autocommit(provider):
         provider, ":memory:", timeout=5, isolation_level="DEFERRED", autocommit=False
     )
     assert conn.isolation_level == "DEFERRED"
-    assert conn.autocommit == False
+    assert not conn.autocommit
     cur = conn.cursor()
     assert conn.in_transaction is True
     cur.execute("CREATE TABLE users (id INTEGER, email TEXT)")
@@ -304,13 +305,13 @@ def test_fetchmany(provider):
 @pytest.mark.parametrize("provider", ["libsql", "sqlite"])
 def test_in_transaction(provider):
     conn = connect(provider, ":memory:")
-    assert conn.in_transaction == False
+    assert not conn.in_transaction
     cur = conn.cursor()
-    assert conn.in_transaction == False
+    assert not conn.in_transaction
     cur.execute("CREATE TABLE users (id INTEGER, email TEXT)")
     cur.execute("INSERT INTO users VALUES (?, ?)", (1, "alice@example.com"))
     cur.execute("INSERT INTO users VALUES (?, ?)", (2, "bob@example.com"))
-    assert conn.in_transaction == True
+    assert conn.in_transaction
 
 
 @pytest.mark.parametrize("provider", ["libsql-remote", "libsql", "sqlite"])
@@ -368,7 +369,7 @@ def test_context_manager_rollback(provider):
     try:
         cur.execute("SELECT COUNT(*) FROM t")
         # If we get here, the table exists (rollback didn't work)
-        assert False, "Table should not exist after rollback"
+        raise AssertionError("Table should not exist after rollback")
     except Exception:
         # Table doesn't exist, which is what we expect after rollback
         pass
@@ -410,29 +411,29 @@ def test_context_manager_nested(provider):
 def test_context_manager_connection_reuse(provider):
     """Test that connection remains usable after context manager exit"""
     conn = connect(provider, ":memory:")
-    
+
     # First use with context manager
     with conn as c:
         c.execute("CREATE TABLE t(x)")
         c.execute("INSERT INTO t VALUES (1)")
-    
+
     # Connection should still be valid
     cur = conn.cursor()
     cur.execute("INSERT INTO t VALUES (2)")
     conn.commit()
-    
+
     # Verify both inserts worked
     cur.execute("SELECT COUNT(*) FROM t")
     assert cur.fetchone()[0] == 2
-    
+
     # Use context manager again
     with conn as c:
         c.execute("INSERT INTO t VALUES (3)")
-    
+
     # Final verification
     cur.execute("SELECT COUNT(*) FROM t")
     assert cur.fetchone()[0] == 3
-    
+
     conn.close()
 
 
@@ -440,11 +441,11 @@ def test_context_manager_connection_reuse(provider):
 def test_context_manager_nested_exception(provider):
     """Test exception handling in nested context managers"""
     conn = connect(provider, ":memory:")
-    
+
     # Create table outside context
     conn.execute("CREATE TABLE t(x)")
     conn.commit()
-    
+
     # Test that nested context managers share the same transaction
     # An exception in an inner context will roll back the entire transaction
     try:
@@ -459,20 +460,20 @@ def test_context_manager_nested_exception(provider):
             # The inner rollback affects the entire transaction
             # So value 1 is also rolled back
             c1.execute("INSERT INTO t VALUES (3)")
-    except:
+    except Exception:
         pass
-    
+
     # Only value 3 should be committed (1 and 2 were rolled back together)
     cur = conn.cursor()
     cur.execute("SELECT x FROM t ORDER BY x")
     results = cur.fetchall()
     assert results == [(3,)]
-    
+
     # Test outer exception after nested context commits
     conn.execute("DROP TABLE t")
     conn.execute("CREATE TABLE t(x)")
     conn.commit()
-    
+
     try:
         with conn as c1:
             c1.execute("INSERT INTO t VALUES (10)")
@@ -483,7 +484,7 @@ def test_context_manager_nested_exception(provider):
             raise RuntimeError("Outer exception")
     except RuntimeError:
         pass
-    
+
     # Values 10 and 20 should be committed by inner context
     cur.execute("SELECT COUNT(*) FROM t")
     assert cur.fetchone()[0] == 2
@@ -493,38 +494,97 @@ def test_context_manager_nested_exception(provider):
 def test_context_manager_manual_transaction_control(provider):
     """Test mixing manual transaction control with context managers"""
     conn = connect(provider, ":memory:")
-    
+
     with conn as c:
         c.execute("CREATE TABLE t(x)")
         c.execute("INSERT INTO t VALUES (1)")
-        
+
         # Manual commit within context
         c.commit()
-        
+
         # Start new transaction
         c.execute("INSERT INTO t VALUES (2)")
         # This will be committed by context manager
-    
+
     # Both values should be present
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM t")
     assert cur.fetchone()[0] == 2
-    
+
     # Test manual rollback within context
     with conn as c:
         c.execute("INSERT INTO t VALUES (3)")
-        
+
         # Manual rollback
         c.rollback()
-        
+
         # New transaction
         c.execute("INSERT INTO t VALUES (4)")
         # This will be committed by context manager
-    
+
     # Should have values 1, 2, and 4 (not 3)
     cur.execute("SELECT x FROM t ORDER BY x")
     results = cur.fetchall()
     assert results == [(1,), (2,), (4,)]
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_error_hierarchy(provider):
+    mod = libsql if provider == "libsql" else sqlite3
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    with pytest.raises(mod.IntegrityError):
+        conn.execute("INSERT INTO t VALUES (1)")
+    with pytest.raises(mod.OperationalError):
+        conn.execute("SELECT * FROM missing_table")
+    assert issubclass(mod.IntegrityError, mod.DatabaseError)
+    assert issubclass(mod.DatabaseError, mod.Error)
+
+
+def test_libsql_errors_are_still_value_errors():
+    conn = connect("libsql", ":memory:")
+    with pytest.raises(ValueError):
+        conn.execute("SELECT * FROM missing_table")
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_large_integer_parameters(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    big = 2**40 + 1
+    conn.execute("INSERT INTO t VALUES (?)", (big,))
+    value = conn.execute("SELECT v FROM t").fetchone()[0]
+    assert value == big and isinstance(value, int)
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_fetch_after_exhaustion(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(1,), (2,)])
+    cur = conn.execute("SELECT v FROM t ORDER BY v")
+    assert cur.fetchall() == [(1,), (2,)]
+    assert cur.fetchone() is None
+    assert cur.fetchall() == []
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_cursor_reuse_after_exhaustion(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (v INTEGER)")
+    cur.executemany("INSERT INTO t VALUES (?)", [(1,), (2,)])
+    assert cur.execute("SELECT v FROM t ORDER BY v").fetchmany(5) == [(1,), (2,)]
+    assert cur.execute("SELECT v FROM t ORDER BY v").fetchmany(1) == [(1,)]
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_cursor_after_connection_close_raises(provider):
+    conn = connect(provider, ":memory:")
+    conn.close()
+    with pytest.raises((sqlite3.ProgrammingError, libsql.ProgrammingError)):
+        conn.cursor().execute("SELECT 1")
 
 
 def connect(provider, database, timeout=5, isolation_level="DEFERRED", autocommit=-1):
@@ -534,7 +594,7 @@ def connect(provider, database, timeout=5, isolation_level="DEFERRED", autocommi
         try:
             res = request.urlopen("http://localhost:8080/v2")
         except Exception as _:
-            raise Exception("libsql-remote server is not running")
+            raise Exception("libsql-remote server is not running") from None
         if res.getcode() != 200:
             raise Exception("libsql-remote server is not running")
         return libsql.connect(database, sync_url="http://localhost:8080", auth_token="")
@@ -567,3 +627,75 @@ def connect(provider, database, timeout=5, isolation_level="DEFERRED", autocommi
                 autocommit=autocommit,
             )
     raise Exception(f"Provider `{provider}` is not supported")
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_isolation_level_is_writable(provider):
+    conn = connect(provider, ":memory:")
+    assert conn.isolation_level == "DEFERRED"
+    conn.isolation_level = "immediate"
+    # sqlite3 stores it uppercased only on Python 3.11+; libsql always does.
+    assert conn.isolation_level.upper() == "IMMEDIATE"
+    conn.isolation_level = None
+    assert conn.isolation_level is None
+    with pytest.raises(ValueError):
+        conn.isolation_level = "SERIALIZABLE"
+    assert conn.isolation_level is None
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_isolation_level_none_commits_and_enables_autocommit(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t(x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    assert conn.in_transaction
+    conn.isolation_level = None  # commits the pending transaction
+    assert not conn.in_transaction
+    conn.execute("INSERT INTO t VALUES (2)")
+    assert not conn.in_transaction
+    conn.rollback()
+    assert conn.execute("SELECT count(*) FROM t").fetchone() == (2,)
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_isolation_level_change_applies_to_existing_cursors(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t(x)")
+    conn.isolation_level = None
+    cur.execute("INSERT INTO t VALUES (1)")
+    assert not conn.in_transaction
+    conn.isolation_level = "DEFERRED"
+    cur.execute("INSERT INTO t VALUES (2)")
+    assert conn.in_transaction
+    conn.rollback()
+    assert cur.execute("SELECT count(*) FROM t").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_immediate_isolation_takes_write_lock(provider, tmp_path):
+    db = str(tmp_path / "lock.db")
+    writer = connect(provider, db, isolation_level="IMMEDIATE")
+    writer.execute("CREATE TABLE t(x)")
+    writer.commit()
+    other = connect(provider, db, timeout=0)
+    writer.execute("INSERT INTO t VALUES (1)")  # BEGIN IMMEDIATE: reserved lock
+    with pytest.raises(Exception, match="locked"):
+        other.execute("BEGIN IMMEDIATE")
+    writer.commit()
+    other.execute("BEGIN IMMEDIATE")
+    other.rollback()
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="autocommit attribute is 3.12+")
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_autocommit_change_applies_to_existing_cursors(provider):
+    conn = connect(provider, ":memory:", autocommit=False)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t(x)")
+    conn.commit()
+    conn.autocommit = True
+    cur.execute("INSERT INTO t VALUES (1)")
+    assert not conn.in_transaction
+    with pytest.raises(ValueError):
+        conn.autocommit = 5

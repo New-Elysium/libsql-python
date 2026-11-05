@@ -2,8 +2,7 @@ import libsql
 
 conn = libsql.connect("vector.db")
 
-conn.execute(
-    "CREATE TABLE movies (title TEXT, year INT, embedding F32_BLOB(3))")
+conn.execute("CREATE TABLE movies (title TEXT, year INT, embedding F32_BLOB(3))")
 conn.execute("CREATE INDEX movies_idx ON movies (libsql_vector_idx(embedding))")
 
 conn.execute("""

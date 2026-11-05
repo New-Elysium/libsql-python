@@ -1,0 +1,39 @@
+# Install with: pip install pre-commit && pre-commit install
+# Mirrors the CI `lint` job (ruff, ty, cargo fmt, clippy).
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      # ty resolves `libsql` from libsql.pyi, so no build is needed.
+      - id: ty
+        name: ty check
+        entry: ty check .
+        language: python
+        additional_dependencies: [ty==0.0.97, pytest, pyperf, sqlalchemy]
+        types_or: [python, pyi]
+        pass_filenames: false
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --release -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

@@ -5,11 +5,11 @@ from sqlalchemy import util
 from sqlalchemy.dialects import registry as _registry
 from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
 
+from libsql import Connection
+
 __version__ = "0.1.0-pre"
 
-_registry.register(
-    "sqlite.libsql", "sqlalchemy_libsql", "SQLiteDialect_libsql"
-)
+_registry.register("sqlite.libsql", "sqlalchemy_libsql", "SQLiteDialect_libsql")
 
 
 def _build_connection_url(url, query, secure):
@@ -58,7 +58,6 @@ class SQLiteDialect_libsql(SQLiteDialect_pysqlite):
         return libsql
 
     def on_connect(self):
-        import libsql
 
         sqlite3_connect = super().on_connect()
 
@@ -99,7 +98,7 @@ class SQLiteDialect_libsql(SQLiteDialect_pysqlite):
             # If SQLite native URIs add a parameter like "timeout" that
             # we already have listed here for the python driver, then we need
             # to adjust for that here.
-            for key, type_ in pysqlite_args:
+            for key, _type in pysqlite_args:
                 uri_opts.pop(key, None)
 
             secure = libsql_opts.pop("secure", False)
@@ -109,9 +108,7 @@ class SQLiteDialect_libsql(SQLiteDialect_pysqlite):
             if connect_url != ":memory:":
                 connect_url = os.path.abspath(connect_url)
 
-        libsql_opts.setdefault(
-            "check_same_thread", not self._is_url_file_db(url)
-        )
+        libsql_opts.setdefault("check_same_thread", not self._is_url_file_db(url))
 
         return ([connect_url], libsql_opts)
 

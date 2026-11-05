@@ -2,7 +2,7 @@ import libsql
 
 # You should set the ENCRYPTION_KEY in a environment variable
 # For demo purposes, we're using a fixed key
-encryption_key= "my-safe-encryption-key";
+encryption_key = "my-safe-encryption-key"
 
 conn = libsql.connect("local.db", encryption_key=encryption_key)
 cur = conn.cursor()
