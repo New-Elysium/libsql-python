@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
-        if: matrix.platform != 'windows-i686'
+        if: matrix.platform != 'windows-i686' && matrix.platform != 'windows-aarch64'
         with:
           python-version: |
             3.10
@@ -87,6 +87,21 @@ jobs:
             3.15t
           allow-prereleases: true
           architecture: ${{ matrix.arch || 'x64' }}
+
+      # CPython has no Windows ARM64 builds before 3.11.
+      - uses: actions/setup-python@v6
+        if: matrix.platform == 'windows-aarch64'
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
+            3.14t
+            3.15
+            3.15t
+          allow-prereleases: true
+          architecture: arm64
 
       # Not every interpreter is published for 32-bit Windows.
       - uses: actions/setup-python@v6

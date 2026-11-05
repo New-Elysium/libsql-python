@@ -4,7 +4,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyModule, PyTuple};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
@@ -186,11 +186,11 @@ fn connect(
     encryption_key: Option<String>,
     autocommit: i32,
 ) -> PyResult<Connection> {
-    let mut conn = _connect_core(
+    let conn = _connect_core(
         py,
         database,
         timeout,
-        isolation_level.clone(),
+        isolation_level,
         _check_same_thread,
         _uri,
         sync_url,
@@ -200,14 +200,9 @@ fn connect(
         encryption_key,
     )?;
 
-    conn.autocommit =
-        if autocommit == LEGACY_TRANSACTION_CONTROL || autocommit == 1 || autocommit == 0 {
-            autocommit
-        } else {
-            return Err(PyValueError::new_err(
-                "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL",
-            ));
-        };
+    conn.settings
+        .autocommit
+        .store(validate_autocommit(autocommit)?, Ordering::Release);
     Ok(conn)
 }
 
@@ -264,6 +259,7 @@ fn _connect_core(
         }
     };
 
+    let isolation_level = normalize_isolation_level(isolation_level)?;
     let autocommit = isolation_level.is_none() as i32;
     let conn = db.connect().map_err(to_py_err)?;
     let timeout = Duration::from_secs_f64(timeout);
@@ -274,9 +270,76 @@ fn _connect_core(
             conn: Some(conn),
             handle: rt.clone(),
         }))),
-        isolation_level,
-        autocommit,
+        settings: Arc::new(TxnSettings {
+            isolation_level: Mutex::new(isolation_level),
+            autocommit: AtomicI32::new(autocommit),
+        }),
     })
+}
+
+/// Transaction settings shared by a connection and all of its cursors, so a
+/// change made on the connection also applies to cursors created earlier (as
+/// in `sqlite3`, where cursors consult the connection on every execute).
+struct TxnSettings {
+    isolation_level: Mutex<Option<String>>,
+    autocommit: AtomicI32,
+}
+
+impl TxnSettings {
+    fn isolation_level(&self) -> Option<String> {
+        lock(&self.isolation_level).clone()
+    }
+
+    fn autocommit(&self) -> i32 {
+        self.autocommit.load(Ordering::Acquire)
+    }
+
+    /// Whether statements run without an implicit transaction.
+    fn is_autocommit(&self) -> bool {
+        let legacy = || self.isolation_level().is_none();
+        if cfg!(Py_3_12) {
+            match self.autocommit() {
+                LEGACY_TRANSACTION_CONTROL => legacy(),
+                autocommit => autocommit != 0,
+            }
+        } else {
+            legacy()
+        }
+    }
+
+    /// The statement that opens an implicit transaction (`BEGIN DEFERRED`,
+    /// `BEGIN IMMEDIATE`, ...), honoring the isolation level like `sqlite3`.
+    fn begin_statement(&self) -> String {
+        match self.isolation_level().as_deref() {
+            None | Some("") => "BEGIN".to_string(),
+            Some(level) => format!("BEGIN {level}"),
+        }
+    }
+}
+
+/// Validate an isolation level the way `sqlite3` does: `None` (autocommit),
+/// `""`, `DEFERRED`, `IMMEDIATE` or `EXCLUSIVE`, case-insensitively.
+fn normalize_isolation_level(level: Option<String>) -> PyResult<Option<String>> {
+    let Some(level) = level else {
+        return Ok(None);
+    };
+    let level = level.to_ascii_uppercase();
+    match level.as_str() {
+        "" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE" => Ok(Some(level)),
+        _ => Err(PyValueError::new_err(
+            "isolation_level string must be '', 'DEFERRED', 'IMMEDIATE', or 'EXCLUSIVE'",
+        )),
+    }
+}
+
+fn validate_autocommit(autocommit: i32) -> PyResult<i32> {
+    if autocommit == LEGACY_TRANSACTION_CONTROL || autocommit == 1 || autocommit == 0 {
+        Ok(autocommit)
+    } else {
+        Err(PyValueError::new_err(
+            "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL",
+        ))
+    }
 }
 
 // We need to add a drop guard that runs when we finally drop our
@@ -314,8 +377,7 @@ fn closed_err() -> PyErr {
 pub struct Connection {
     db: libsql_core::Database,
     conn: Mutex<Option<Arc<ConnectionGuard>>>,
-    isolation_level: Option<String>,
-    autocommit: i32,
+    settings: Arc<TxnSettings>,
 }
 
 impl Connection {
@@ -348,8 +410,7 @@ impl Connection {
             stmt: Mutex::new(None),
             rows: Mutex::new(None),
             rowcount: AtomicI64::new(0),
-            autocommit: self.autocommit,
-            isolation_level: self.isolation_level.clone(),
+            settings: self.settings.clone(),
             done: AtomicBool::new(false),
         })
     }
@@ -405,31 +466,40 @@ impl Connection {
     }
 
     #[getter]
-    fn isolation_level(&self) -> Option<String> {
-        self.isolation_level.clone()
+    fn get_isolation_level(&self) -> Option<String> {
+        self.settings.isolation_level()
+    }
+
+    /// Like `sqlite3`: setting `None` commits any open transaction and switches
+    /// to autocommit; other values only affect the next implicit `BEGIN`.
+    #[setter]
+    fn set_isolation_level(&self, py: Python<'_>, level: Option<String>) -> PyResult<()> {
+        let level = normalize_isolation_level(level)?;
+        if level.is_none() {
+            self.commit(py)?;
+        }
+        *lock(&self.settings.isolation_level) = level;
+        Ok(())
     }
 
     #[getter]
     fn in_transaction(&self) -> PyResult<bool> {
         let in_txn = !self.handle()?.is_autocommit();
-        Ok(in_txn || (cfg!(Py_3_12) && self.autocommit == 0))
+        Ok(in_txn || (cfg!(Py_3_12) && self.settings.autocommit() == 0))
     }
 
     #[getter]
     #[cfg(Py_3_12)]
     fn get_autocommit(&self) -> i32 {
-        self.autocommit
+        self.settings.autocommit()
     }
 
     #[setter]
     #[cfg(Py_3_12)]
-    fn set_autocommit(&mut self, autocommit: i32) -> PyResult<()> {
-        if autocommit != LEGACY_TRANSACTION_CONTROL && autocommit != 1 && autocommit != 0 {
-            return Err(PyValueError::new_err(
-                "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL",
-            ));
-        }
-        self.autocommit = autocommit;
+    fn set_autocommit(&self, autocommit: i32) -> PyResult<()> {
+        self.settings
+            .autocommit
+            .store(validate_autocommit(autocommit)?, Ordering::Release);
         Ok(())
     }
 
@@ -465,8 +535,7 @@ pub struct Cursor {
     rows: Mutex<Option<libsql_core::Rows>>,
     rowcount: AtomicI64,
     done: AtomicBool,
-    isolation_level: Option<String>,
-    autocommit: i32,
+    settings: Arc<TxnSettings>,
 }
 
 impl Cursor {
@@ -640,10 +709,12 @@ async fn run_statement(
     conn: &libsql_core::Connection,
     sql: &str,
     params: libsql_core::params::Params,
-    begin_transaction: bool,
+    begin: Option<String>,
 ) -> PyResult<(libsql_core::Statement, Option<libsql_core::Rows>)> {
-    if begin_transaction && conn.is_autocommit() {
-        conn.execute("BEGIN", ()).await.map_err(to_py_err)?;
+    if let Some(begin) = begin
+        && conn.is_autocommit()
+    {
+        conn.execute(&begin, ()).await.map_err(to_py_err)?;
     }
     let stmt = conn.prepare(sql).await.map_err(to_py_err)?;
     let rows = if !stmt.columns().is_empty() {
@@ -665,10 +736,10 @@ fn execute(
     // Convert parameters while attached to the interpreter; everything after
     // this point is plain Rust data and runs detached.
     let params = convert_params(parameters)?;
-    let begin_transaction = !determine_autocommit(cursor) && stmt_is_dml(&sql);
+    let begin = (!cursor.settings.is_autocommit() && stmt_is_dml(&sql))
+        .then(|| cursor.settings.begin_statement());
 
-    let (stmt, rows) =
-        block_on_detached(py, run_statement(&conn, &sql, params, begin_transaction))?;
+    let (stmt, rows) = block_on_detached(py, run_statement(&conn, &sql, params, begin))?;
 
     cursor.done.store(false, Ordering::Release);
     cursor
@@ -722,17 +793,6 @@ fn convert_params(parameters: Option<ListOrTuple<'_>>) -> PyResult<libsql_core::
         params.push(param);
     }
     Ok(libsql_core::params::Params::Positional(params))
-}
-
-fn determine_autocommit(cursor: &Cursor) -> bool {
-    if cfg!(Py_3_12) {
-        match cursor.autocommit {
-            LEGACY_TRANSACTION_CONTROL => cursor.isolation_level.is_none(),
-            _ => cursor.autocommit != 0,
-        }
-    } else {
-        cursor.isolation_level.is_none()
-    }
 }
 
 fn stmt_is_dml(sql: &str) -> bool {

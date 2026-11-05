@@ -626,3 +626,74 @@ def connect(provider, database, timeout=5, isolation_level="DEFERRED", autocommi
                 autocommit=autocommit,
             )
     raise Exception(f"Provider `{provider}` is not supported")
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_isolation_level_is_writable(provider):
+    conn = connect(provider, ":memory:")
+    assert conn.isolation_level == "DEFERRED"
+    conn.isolation_level = "immediate"
+    assert conn.isolation_level == "IMMEDIATE"
+    conn.isolation_level = None
+    assert conn.isolation_level is None
+    with pytest.raises(ValueError):
+        conn.isolation_level = "SERIALIZABLE"
+    assert conn.isolation_level is None
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_isolation_level_none_commits_and_enables_autocommit(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t(x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    assert conn.in_transaction
+    conn.isolation_level = None  # commits the pending transaction
+    assert not conn.in_transaction
+    conn.execute("INSERT INTO t VALUES (2)")
+    assert not conn.in_transaction
+    conn.rollback()
+    assert conn.execute("SELECT count(*) FROM t").fetchone() == (2,)
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_isolation_level_change_applies_to_existing_cursors(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t(x)")
+    conn.isolation_level = None
+    cur.execute("INSERT INTO t VALUES (1)")
+    assert not conn.in_transaction
+    conn.isolation_level = "DEFERRED"
+    cur.execute("INSERT INTO t VALUES (2)")
+    assert conn.in_transaction
+    conn.rollback()
+    assert cur.execute("SELECT count(*) FROM t").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_immediate_isolation_takes_write_lock(provider, tmp_path):
+    db = str(tmp_path / "lock.db")
+    writer = connect(provider, db, isolation_level="IMMEDIATE")
+    writer.execute("CREATE TABLE t(x)")
+    writer.commit()
+    other = connect(provider, db, timeout=0)
+    writer.execute("INSERT INTO t VALUES (1)")  # BEGIN IMMEDIATE: reserved lock
+    with pytest.raises(Exception, match="locked"):
+        other.execute("BEGIN IMMEDIATE")
+    writer.commit()
+    other.execute("BEGIN IMMEDIATE")
+    other.rollback()
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="autocommit attribute is 3.12+")
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_autocommit_change_applies_to_existing_cursors(provider):
+    conn = connect(provider, ":memory:", autocommit=False)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t(x)")
+    conn.commit()
+    conn.autocommit = True
+    cur.execute("INSERT INTO t VALUES (1)")
+    assert not conn.in_transaction
+    with pytest.raises(ValueError):
+        conn.autocommit = 5
