@@ -332,6 +332,7 @@ fn normalize_isolation_level(level: Option<String>) -> PyResult<Option<String>> 
     }
 }
 
+#[cfg(Py_3_12)]
 fn validate_autocommit(autocommit: i32) -> PyResult<i32> {
     if autocommit == LEGACY_TRANSACTION_CONTROL || autocommit == 1 || autocommit == 0 {
         Ok(autocommit)
