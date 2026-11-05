@@ -2,9 +2,10 @@ use ::libsql as libsql_core;
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyModule, PyTuple};
-use std::cell::RefCell;
-use std::sync::{Arc, OnceLock};
+use pyo3::types::{PyBytes, PyList, PyModule, PyTuple};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 
@@ -33,6 +34,44 @@ fn rt() -> Handle {
     })
     .handle()
     .clone()
+}
+
+/// Lock a mutex, ignoring poisoning (the guarded state stays usable after a
+/// panic in another thread).
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run a future to completion on the shared runtime while detached from the
+/// Python interpreter, so other Python threads can make progress.
+fn block_on_detached<F, T>(py: Python<'_>, fut: F) -> T
+where
+    F: Future<Output = T> + Send,
+    T: Send,
+{
+    py.detach(|| rt().block_on(fut))
+}
+
+/// Like [`block_on_detached`], but periodically re-attaches to check for
+/// pending signals so that Ctrl-C can interrupt long-running operations.
+fn block_on_interruptible<F, T>(py: Python<'_>, fut: F) -> PyResult<T>
+where
+    F: Future<Output = Result<T, libsql_core::errors::Error>> + Send,
+    T: Send,
+{
+    py.detach(|| {
+        rt().block_on(async move {
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    out = &mut fut => break out.map_err(to_py_err),
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                        Python::attach(|py| py.check_signals())?;
+                    }
+                }
+            }
+        })
+    })
 }
 
 fn to_py_err(error: libsql_core::errors::Error) -> PyErr {
@@ -137,49 +176,38 @@ fn _connect_core(
     let ver = env!("CARGO_PKG_VERSION");
     let ver = format!("libsql-python-rpc-{ver}");
     let rt = rt();
-    let encryption_config = match encryption_key {
-        Some(key) => {
-            let cipher = libsql_core::Cipher::default();
-            let encryption_config = libsql_core::EncryptionConfig::new(cipher, key.into());
-            Some(encryption_config)
-        }
-        None => None,
-    };
+    let encryption_config = encryption_key.map(|key| {
+        let cipher = libsql_core::Cipher::default();
+        libsql_core::EncryptionConfig::new(cipher, key.into())
+    });
     let db = if is_remote_path(&database) {
         let result = libsql_core::Database::open_remote_internal(database.clone(), auth_token, ver);
         result.map_err(to_py_err)?
     } else {
         match sync_url {
             Some(sync_url) => {
-                let sync_interval = sync_interval.map(|i| std::time::Duration::from_secs_f64(i));
+                if encryption_config.is_some() {
+                    return Err(PyValueError::new_err(
+                        "encryption is not supported for synced databases",
+                    ));
+                }
                 let mut builder = libsql_core::Builder::new_synced_database(
                     database,
                     sync_url,
                     auth_token.to_string(),
                 );
-                if let Some(_) = encryption_config {
-                    return Err(PyValueError::new_err(
-                        "encryption is not supported for synced databases",
-                    ));
-                }
                 if let Some(sync_interval) = sync_interval {
-                    builder = builder.sync_interval(sync_interval);
+                    builder = builder.sync_interval(Duration::from_secs_f64(sync_interval));
                 }
                 builder = builder.remote_writes(!offline);
-                let fut = builder.build();
-                tokio::pin!(fut);
-                let result = rt.block_on(check_signals(py, fut));
-                result.map_err(to_py_err)?
+                block_on_interruptible(py, builder.build())?
             }
             None => {
                 let mut builder = libsql_core::Builder::new_local(database);
                 if let Some(config) = encryption_config {
                     builder = builder.encryption_config(config);
                 }
-                let fut = builder.build();
-                tokio::pin!(fut);
-                let result = rt.block_on(check_signals(py, fut));
-                result.map_err(to_py_err)?
+                block_on_interruptible(py, builder.build())?
             }
         }
     };
@@ -190,7 +218,7 @@ fn _connect_core(
     conn.busy_timeout(timeout).map_err(to_py_err)?;
     Ok(Connection {
         db,
-        conn: RefCell::new(Some(Arc::new(ConnectionGuard {
+        conn: Mutex::new(Some(Arc::new(ConnectionGuard {
             conn: Some(conn),
             handle: rt.clone(),
         }))),
@@ -213,7 +241,7 @@ impl std::ops::Deref for ConnectionGuard {
     type Target = libsql_core::Connection;
 
     fn deref(&self) -> &Self::Target {
-        &self.conn.as_ref().expect("Connection already dropped")
+        self.conn.as_ref().expect("Connection already dropped")
     }
 }
 
@@ -226,175 +254,151 @@ impl Drop for ConnectionGuard {
     }
 }
 
+fn closed_err() -> PyErr {
+    PyValueError::new_err("Connection already closed")
+}
+
 #[pyclass]
 pub struct Connection {
     db: libsql_core::Database,
-    conn: RefCell<Option<Arc<ConnectionGuard>>>,
+    conn: Mutex<Option<Arc<ConnectionGuard>>>,
     isolation_level: Option<String>,
     autocommit: i32,
 }
 
-// SAFETY: The libsql crate guarantees that `Connection` is thread-safe.
-unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
+impl Connection {
+    fn handle(&self) -> PyResult<Arc<ConnectionGuard>> {
+        lock(&self.conn).as_ref().cloned().ok_or_else(closed_err)
+    }
+
+    fn finish_transaction(&self, py: Python<'_>, sql: &'static str) -> PyResult<()> {
+        // TODO: Switch to libSQL transaction API
+        let conn = self.handle()?;
+        if !conn.is_autocommit() {
+            block_on_detached(py, conn.execute(sql, ())).map_err(to_py_err)?;
+        }
+        Ok(())
+    }
+}
 
 #[pymethods]
 impl Connection {
-    fn close(self_: PyRef<'_, Self>, _py: Python<'_>) -> PyResult<()> {
-        self_.conn.replace(None);
+    fn close(&self) -> PyResult<()> {
+        let _enter = rt().enter();
+        drop(lock(&self.conn).take());
         Ok(())
     }
 
     fn cursor(&self) -> PyResult<Cursor> {
         Ok(Cursor {
             arraysize: 1,
-            conn: RefCell::new(Some(self.conn.borrow().as_ref().unwrap().clone())),
-            stmt: RefCell::new(None),
-            rows: RefCell::new(None),
-            rowcount: RefCell::new(0),
+            conn: Mutex::new(Some(self.handle()?)),
+            stmt: Mutex::new(None),
+            rows: Mutex::new(None),
+            rowcount: AtomicI64::new(0),
             autocommit: self.autocommit,
             isolation_level: self.isolation_level.clone(),
-            done: RefCell::new(false),
+            done: AtomicBool::new(false),
         })
     }
 
-    fn sync(self_: PyRef<'_, Self>, py: Python<'_>) -> PyResult<()> {
+    fn sync(&self, py: Python<'_>) -> PyResult<()> {
         let fut = {
             let _enter = rt().enter();
-            self_.db.sync()
+            self.db.sync()
         };
-        tokio::pin!(fut);
-
-        rt().block_on(check_signals(py, fut)).map_err(to_py_err)?;
+        block_on_interruptible(py, fut)?;
         Ok(())
     }
 
-    fn commit(self_: PyRef<'_, Self>) -> PyResult<()> {
-        // TODO: Switch to libSQL transaction API
-        if !self_.conn.borrow().as_ref().unwrap().is_autocommit() {
-            rt().block_on(async {
-                self_
-                    .conn
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .execute("COMMIT", ())
-                    .await
-            })
-            .map_err(to_py_err)?;
-        }
-        Ok(())
+    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        self.finish_transaction(py, "COMMIT")
     }
 
-    fn rollback(self_: PyRef<'_, Self>) -> PyResult<()> {
-        // TODO: Switch to libSQL transaction API
-        if !self_.conn.borrow().as_ref().unwrap().is_autocommit() {
-            rt().block_on(async {
-                self_
-                    .conn
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .execute("ROLLBACK", ())
-                    .await
-            })
-            .map_err(to_py_err)?;
-        }
-        Ok(())
+    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        self.finish_transaction(py, "ROLLBACK")
     }
 
     #[pyo3(signature = (sql, parameters=None))]
     fn execute(
-        self_: PyRef<'_, Self>,
+        &self,
+        py: Python<'_>,
         sql: String,
         parameters: Option<ListOrTuple<'_>>,
     ) -> PyResult<Cursor> {
-        let cursor = Connection::cursor(&self_)?;
-        rt().block_on(async { execute(&cursor, sql, parameters).await })?;
+        let cursor = self.cursor()?;
+        execute(py, &cursor, sql, parameters)?;
         Ok(cursor)
     }
 
     #[pyo3(signature = (sql, parameters=None))]
     fn executemany(
-        self_: PyRef<'_, Self>,
+        &self,
+        py: Python<'_>,
         sql: String,
         parameters: Option<&Bound<'_, PyList>>,
     ) -> PyResult<Cursor> {
-        let cursor = Connection::cursor(&self_)?;
-        for parameters in parameters.unwrap().iter() {
-            let parameters = parameters.extract::<ListOrTuple>()?;
-            rt().block_on(async { execute(&cursor, sql.clone(), Some(parameters)).await })?;
-        }
+        let cursor = self.cursor()?;
+        execute_many(py, &cursor, &sql, parameters)?;
         Ok(cursor)
     }
 
-    fn executescript(self_: PyRef<'_, Self>, script: String) -> PyResult<()> {
-        let _ = rt()
-            .block_on(async {
-                self_
-                    .conn
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .execute_batch(&script)
-                    .await
-            })
-            .map_err(to_py_err);
+    fn executescript(&self, py: Python<'_>, script: String) -> PyResult<()> {
+        let conn = self.handle()?;
+        // NOTE: errors from the script are intentionally ignored here to keep
+        // the existing behavior; `Cursor.executescript` does propagate them.
+        let _ =
+            block_on_detached(py, async { conn.execute_batch(&script).await }).map_err(to_py_err);
         Ok(())
     }
 
     #[getter]
-    fn isolation_level(self_: PyRef<'_, Self>) -> Option<String> {
-        self_.isolation_level.clone()
+    fn isolation_level(&self) -> Option<String> {
+        self.isolation_level.clone()
     }
 
     #[getter]
-    fn in_transaction(self_: PyRef<'_, Self>) -> PyResult<bool> {
-        #[cfg(Py_3_12)]
-        {
-            Ok(!self_.conn.borrow().as_ref().unwrap().is_autocommit() || self_.autocommit == 0)
-        }
-        #[cfg(not(Py_3_12))]
-        {
-            Ok(!self_.conn.borrow().as_ref().unwrap().is_autocommit())
-        }
+    fn in_transaction(&self) -> PyResult<bool> {
+        let in_txn = !self.handle()?.is_autocommit();
+        Ok(in_txn || (cfg!(Py_3_12) && self.autocommit == 0))
     }
 
     #[getter]
     #[cfg(Py_3_12)]
-    fn get_autocommit(self_: PyRef<'_, Self>) -> PyResult<i32> {
-        Ok(self_.autocommit)
+    fn get_autocommit(&self) -> i32 {
+        self.autocommit
     }
 
     #[setter]
     #[cfg(Py_3_12)]
-    fn set_autocommit(mut self_: PyRefMut<'_, Self>, autocommit: i32) -> PyResult<()> {
+    fn set_autocommit(&mut self, autocommit: i32) -> PyResult<()> {
         if autocommit != LEGACY_TRANSACTION_CONTROL && autocommit != 1 && autocommit != 0 {
             return Err(PyValueError::new_err(
                 "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL",
             ));
         }
-        self_.autocommit = autocommit;
+        self.autocommit = autocommit;
         Ok(())
     }
 
-    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
-        Ok(slf)
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
     }
 
     #[pyo3(signature = (exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
-        self_: PyRef<'_, Self>,
+        &self,
+        py: Python<'_>,
         exc_type: Option<&Bound<'_, PyAny>>,
         _exc_val: Option<&Bound<'_, PyAny>>,
         _exc_tb: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
         if exc_type.is_none() {
             // Commit on clean exit
-            Connection::commit(self_)?;
+            self.commit(py)?;
         } else {
             // Rollback on error
-            Connection::rollback(self_)?;
+            self.rollback(py)?;
         }
         Ok(false) // Always propagate exceptions
     }
@@ -404,277 +408,277 @@ impl Connection {
 pub struct Cursor {
     #[pyo3(get, set)]
     arraysize: usize,
-    conn: RefCell<Option<Arc<ConnectionGuard>>>,
-    stmt: RefCell<Option<libsql_core::Statement>>,
-    rows: RefCell<Option<libsql_core::Rows>>,
-    rowcount: RefCell<i64>,
-    done: RefCell<bool>,
+    conn: Mutex<Option<Arc<ConnectionGuard>>>,
+    stmt: Mutex<Option<libsql_core::Statement>>,
+    rows: Mutex<Option<libsql_core::Rows>>,
+    rowcount: AtomicI64,
+    done: AtomicBool,
     isolation_level: Option<String>,
     autocommit: i32,
 }
 
-// SAFETY: The libsql crate guarantees that `Connection` is thread-safe.
-unsafe impl Send for Cursor {}
-unsafe impl Sync for Cursor {}
+impl Cursor {
+    fn handle(&self) -> PyResult<Arc<ConnectionGuard>> {
+        lock(&self.conn).as_ref().cloned().ok_or_else(closed_err)
+    }
+
+    /// Fetch up to `limit` rows (all remaining rows when `None`) as plain Rust
+    /// values, detached from the interpreter. Returns `None` when the last
+    /// statement produced no result set.
+    fn fetch_values(
+        &self,
+        py: Python<'_>,
+        limit: Option<usize>,
+    ) -> PyResult<Option<Vec<Vec<libsql_core::Value>>>> {
+        py.detach(|| {
+            let mut guard = lock(&self.rows);
+            let Some(rows) = guard.as_mut() else {
+                return Ok(None);
+            };
+            let mut out = vec![];
+            // The libSQL Rows.next() method restarts the iteration if it
+            // has reached the end, which is why we need to check if we're
+            // done before iterating.
+            if self.done.load(Ordering::Acquire) {
+                return Ok(Some(out));
+            }
+            let column_count = rows.column_count();
+            rt().block_on(async {
+                while limit.is_none_or(|limit| out.len() < limit) {
+                    match rows.next().await.map_err(to_py_err)? {
+                        Some(row) => {
+                            let mut values = Vec::with_capacity(column_count as usize);
+                            for col_idx in 0..column_count {
+                                values.push(row.get_value(col_idx).map_err(to_py_err)?);
+                            }
+                            out.push(values);
+                        }
+                        None => {
+                            self.done.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+                Ok::<(), PyErr>(())
+            })?;
+            Ok(Some(out))
+        })
+    }
+}
 
 impl Drop for Cursor {
     fn drop(&mut self) {
         let _enter = rt().enter();
-        self.conn.replace(None);
-        self.stmt.replace(None);
-        self.rows.replace(None);
+        drop(lock(&self.conn).take());
+        drop(lock(&self.stmt).take());
+        drop(lock(&self.rows).take());
     }
 }
 
 #[pymethods]
 impl Cursor {
-    fn close(self_: PyRef<'_, Self>) -> PyResult<()> {
-        rt().block_on(async {
-            let cursor: &Cursor = &self_;
-            cursor.conn.replace(None);
-            cursor.stmt.replace(None);
-            cursor.rows.replace(None);
-        });
+    fn close(&self) -> PyResult<()> {
+        let _enter = rt().enter();
+        drop(lock(&self.conn).take());
+        drop(lock(&self.stmt).take());
+        drop(lock(&self.rows).take());
         Ok(())
     }
 
     #[pyo3(signature = (sql, parameters=None))]
     fn execute<'a>(
         self_: PyRef<'a, Self>,
+        py: Python<'_>,
         sql: String,
         parameters: Option<ListOrTuple<'_>>,
-    ) -> PyResult<pyo3::PyRef<'a, Self>> {
-        rt().block_on(async { execute(&self_, sql, parameters).await })?;
+    ) -> PyResult<PyRef<'a, Self>> {
+        execute(py, &self_, sql, parameters)?;
         Ok(self_)
     }
 
     #[pyo3(signature = (sql, parameters=None))]
     fn executemany<'a>(
         self_: PyRef<'a, Self>,
+        py: Python<'_>,
         sql: String,
         parameters: Option<&Bound<'_, PyList>>,
-    ) -> PyResult<pyo3::PyRef<'a, Cursor>> {
-        for parameters in parameters.unwrap().iter() {
-            let parameters = parameters.extract::<ListOrTuple>()?;
-            rt().block_on(async { execute(&self_, sql.clone(), Some(parameters)).await })?;
-        }
+    ) -> PyResult<PyRef<'a, Self>> {
+        execute_many(py, &self_, &sql, parameters)?;
         Ok(self_)
     }
 
     fn executescript<'a>(
         self_: PyRef<'a, Self>,
+        py: Python<'_>,
         script: String,
-    ) -> PyResult<pyo3::PyRef<'a, Self>> {
-        rt().block_on(async {
-            self_
-                .conn
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .execute_batch(&script)
-                .await
-        })
-        .map_err(to_py_err)?;
+    ) -> PyResult<PyRef<'a, Self>> {
+        let conn = self_.handle()?;
+        block_on_detached(py, async { conn.execute_batch(&script).await }).map_err(to_py_err)?;
         Ok(self_)
     }
 
     #[getter]
-    fn description(self_: PyRef<'_, Self>) -> PyResult<Option<Bound<'_, PyTuple>>> {
-        let stmt = self_.stmt.borrow();
-        let mut elements: Vec<Py<PyAny>> = vec![];
-        match stmt.as_ref() {
-            Some(stmt) => {
-                for column in stmt.columns() {
-                    let name = column.name();
-                    let element = (
-                        name,
-                        self_.py().None(),
-                        self_.py().None(),
-                        self_.py().None(),
-                        self_.py().None(),
-                        self_.py().None(),
-                        self_.py().None(),
-                    )
-                        .into_pyobject(self_.py())
-                        .unwrap();
-                    elements.push(element.into());
-                }
-                let elements = PyTuple::new(self_.py(), elements)?;
-                Ok(Some(elements))
-            }
-            None => Ok(None),
+    fn description<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        let stmt = lock(&self.stmt);
+        let Some(stmt) = stmt.as_ref() else {
+            return Ok(None);
+        };
+        let mut elements = vec![];
+        for column in stmt.columns() {
+            let element = (
+                column.name(),
+                py.None(),
+                py.None(),
+                py.None(),
+                py.None(),
+                py.None(),
+                py.None(),
+            )
+                .into_pyobject(py)?;
+            elements.push(element);
         }
+        Ok(Some(PyTuple::new(py, elements)?))
     }
 
-    fn fetchone(self_: PyRef<'_, Self>) -> PyResult<Option<Bound<'_, PyTuple>>> {
-        let mut rows = self_.rows.borrow_mut();
-        match rows.as_mut() {
-            Some(rows) => {
-                let row = rt().block_on(rows.next()).map_err(to_py_err)?;
-                match row {
-                    Some(row) => {
-                        let row = convert_row(self_.py(), row, rows.column_count())?;
-                        Ok(Some(row))
-                    }
-                    None => Ok(None),
-                }
-            }
+    fn fetchone<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        match self.fetch_values(py, Some(1))? {
+            Some(rows) => rows
+                .into_iter()
+                .next()
+                .map(|row| convert_row(py, row))
+                .transpose(),
             None => Ok(None),
         }
     }
 
     #[pyo3(signature = (size=None))]
-    fn fetchmany(self_: PyRef<'_, Self>, size: Option<i64>) -> PyResult<Option<Bound<'_, PyList>>> {
-        let mut rows = self_.rows.borrow_mut();
-        match rows.as_mut() {
-            Some(rows) => {
-                let size = size.unwrap_or(self_.arraysize as i64);
-                let mut elements: Vec<Py<PyAny>> = vec![];
-                // The libSQL Rows.next() method restarts the iteration if it
-                // has reached the end, which is why we need to check if we're
-                // done before iterating.
-                if !*self_.done.borrow() {
-                    for _ in 0..size {
-                        let row = rt()
-                            .block_on(async { rows.next().await })
-                            .map_err(to_py_err)?;
-                        match row {
-                            Some(row) => {
-                                let row = convert_row(self_.py(), row, rows.column_count())?;
-                                elements.push(row.into());
-                            }
-                            None => {
-                                self_.done.replace(true);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(Some(PyList::new(self_.py(), elements)?))
-            }
-            None => Ok(None),
-        }
+    fn fetchmany<'py>(
+        &self,
+        py: Python<'py>,
+        size: Option<i64>,
+    ) -> PyResult<Option<Bound<'py, PyList>>> {
+        let size = size.unwrap_or(self.arraysize as i64).max(0) as usize;
+        self.fetch_values(py, Some(size))?
+            .map(|rows| convert_rows(py, rows))
+            .transpose()
     }
 
-    fn fetchall(self_: PyRef<'_, Self>) -> PyResult<Option<Bound<'_, PyList>>> {
-        let mut rows = self_.rows.borrow_mut();
-        match rows.as_mut() {
-            Some(rows) => {
-                let mut elements: Vec<Py<PyAny>> = vec![];
-                loop {
-                    let row = rt()
-                        .block_on(async { rows.next().await })
-                        .map_err(to_py_err)?;
-                    match row {
-                        Some(row) => {
-                            let row = convert_row(self_.py(), row, rows.column_count())?;
-                            elements.push(row.into());
-                        }
-                        None => break,
-                    }
-                }
-                Ok(Some(PyList::new(self_.py(), elements)?))
-            }
-            None => Ok(None),
+    fn fetchall<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {
+        self.fetch_values(py, None)?
+            .map(|rows| convert_rows(py, rows))
+            .transpose()
+    }
+
+    #[getter]
+    fn lastrowid(&self) -> PyResult<Option<i64>> {
+        if lock(&self.stmt).is_some() {
+            Ok(Some(self.handle()?.last_insert_rowid()))
+        } else {
+            Ok(None)
         }
     }
 
     #[getter]
-    fn lastrowid(self_: PyRef<'_, Self>) -> PyResult<Option<i64>> {
-        let stmt = self_.stmt.borrow();
-        match stmt.as_ref() {
-            Some(_) => Ok(Some(
-                self_.conn.borrow().as_ref().unwrap().last_insert_rowid(),
-            )),
-            None => Ok(None),
-        }
-    }
-
-    #[getter]
-    fn rowcount(self_: PyRef<'_, Self>) -> PyResult<i64> {
-        Ok(*self_.rowcount.borrow())
+    fn rowcount(&self) -> i64 {
+        self.rowcount.load(Ordering::Acquire)
     }
 }
 
-async fn begin_transaction(conn: &libsql_core::Connection) -> PyResult<()> {
-    conn.execute("BEGIN", ()).await.map_err(to_py_err)?;
-    Ok(())
-}
-
-async fn execute<'py>(
-    cursor: &Cursor,
-    sql: String,
-    parameters: Option<ListOrTuple<'py>>,
-) -> PyResult<()> {
-    if cursor.conn.borrow().as_ref().is_none() {
-        return Err(PyValueError::new_err("Connection already closed"));
+async fn run_statement(
+    conn: &libsql_core::Connection,
+    sql: &str,
+    params: libsql_core::params::Params,
+    begin_transaction: bool,
+) -> PyResult<(libsql_core::Statement, Option<libsql_core::Rows>)> {
+    if begin_transaction && conn.is_autocommit() {
+        conn.execute("BEGIN", ()).await.map_err(to_py_err)?;
     }
-    let stmt_is_dml = stmt_is_dml(&sql);
-    let autocommit = determine_autocommit(cursor);
-    if !autocommit && stmt_is_dml && cursor.conn.borrow().as_ref().unwrap().is_autocommit() {
-        begin_transaction(&cursor.conn.borrow().as_ref().unwrap()).await?;
-    }
-    let params = match parameters {
-        Some(parameters) => {
-            let mut params = vec![];
-            for param in parameters.iter() {
-                let param = if param.is_none() {
-                    libsql_core::Value::Null
-                } else if let Ok(value) = param.extract::<i32>() {
-                    libsql_core::Value::Integer(value as i64)
-                } else if let Ok(value) = param.extract::<f64>() {
-                    libsql_core::Value::Real(value)
-                } else if let Ok(value) = param.extract::<&str>() {
-                    libsql_core::Value::Text(value.to_string())
-                } else if let Ok(value) = param.extract::<&[u8]>() {
-                    libsql_core::Value::Blob(value.to_vec())
-                } else {
-                    return Err(PyValueError::new_err(format!(
-                        "Unsupported parameter type {}",
-                        param.to_string()
-                    )));
-                };
-                params.push(param);
-            }
-            libsql_core::params::Params::Positional(params)
-        }
-        None => libsql_core::params::Params::None,
-    };
-    let mut stmt = cursor
-        .conn
-        .borrow()
-        .as_ref()
-        .unwrap()
-        .prepare(&sql)
-        .await
-        .map_err(to_py_err)?;
-
-    if stmt.columns().iter().len() > 0 {
-        let rows = stmt.query(params).await.map_err(to_py_err)?;
-        cursor.rows.replace(Some(rows));
+    let stmt = conn.prepare(sql).await.map_err(to_py_err)?;
+    let rows = if !stmt.columns().is_empty() {
+        Some(stmt.query(params).await.map_err(to_py_err)?)
     } else {
         stmt.execute(params).await.map_err(to_py_err)?;
-        cursor.rows.replace(None);
-    }
+        None
+    };
+    Ok((stmt, rows))
+}
 
-    let mut rowcount = cursor.rowcount.borrow_mut();
-    *rowcount += cursor.conn.borrow().as_ref().unwrap().changes() as i64;
+fn execute(
+    py: Python<'_>,
+    cursor: &Cursor,
+    sql: String,
+    parameters: Option<ListOrTuple<'_>>,
+) -> PyResult<()> {
+    let conn = cursor.handle()?;
+    // Convert parameters while attached to the interpreter; everything after
+    // this point is plain Rust data and runs detached.
+    let params = convert_params(parameters)?;
+    let begin_transaction = !determine_autocommit(cursor) && stmt_is_dml(&sql);
 
-    cursor.stmt.replace(Some(stmt));
+    let (stmt, rows) =
+        block_on_detached(py, run_statement(&conn, &sql, params, begin_transaction))?;
+
+    cursor.done.store(false, Ordering::Release);
+    cursor
+        .rowcount
+        .fetch_add(conn.changes() as i64, Ordering::AcqRel);
+
+    // Dropping the previous statement/rows may need a tokio context.
+    let _enter = rt().enter();
+    *lock(&cursor.rows) = rows;
+    *lock(&cursor.stmt) = Some(stmt);
     Ok(())
+}
+
+fn execute_many(
+    py: Python<'_>,
+    cursor: &Cursor,
+    sql: &str,
+    parameters: Option<&Bound<'_, PyList>>,
+) -> PyResult<()> {
+    let parameters = parameters
+        .ok_or_else(|| PyValueError::new_err("executemany requires a list of parameters"))?;
+    for parameters in parameters.iter() {
+        let parameters = parameters.extract::<ListOrTuple>()?;
+        execute(py, cursor, sql.to_string(), Some(parameters))?;
+    }
+    Ok(())
+}
+
+fn convert_params(parameters: Option<ListOrTuple<'_>>) -> PyResult<libsql_core::params::Params> {
+    let Some(parameters) = parameters else {
+        return Ok(libsql_core::params::Params::None);
+    };
+    let mut params = vec![];
+    for param in parameters.iter() {
+        let param = if param.is_none() {
+            libsql_core::Value::Null
+        } else if let Ok(value) = param.extract::<i64>() {
+            libsql_core::Value::Integer(value)
+        } else if let Ok(value) = param.extract::<f64>() {
+            libsql_core::Value::Real(value)
+        } else if let Ok(value) = param.extract::<&str>() {
+            libsql_core::Value::Text(value.to_string())
+        } else if let Ok(value) = param.extract::<&[u8]>() {
+            libsql_core::Value::Blob(value.to_vec())
+        } else {
+            return Err(PyValueError::new_err(format!(
+                "Unsupported parameter type {}",
+                param
+            )));
+        };
+        params.push(param);
+    }
+    Ok(libsql_core::params::Params::Positional(params))
 }
 
 fn determine_autocommit(cursor: &Cursor) -> bool {
-    #[cfg(Py_3_12)]
-    {
+    if cfg!(Py_3_12) {
         match cursor.autocommit {
             LEGACY_TRANSACTION_CONTROL => cursor.isolation_level.is_none(),
             _ => cursor.autocommit != 0,
         }
-    }
-
-    #[cfg(not(Py_3_12))]
-    {
+    } else {
         cursor.isolation_level.is_none()
     }
 }
@@ -685,40 +689,39 @@ fn stmt_is_dml(sql: &str) -> bool {
     sql.starts_with("INSERT") || sql.starts_with("UPDATE") || sql.starts_with("DELETE")
 }
 
-fn convert_row(
-    py: Python,
-    row: libsql_core::Row,
-    column_count: i32,
-) -> PyResult<Bound<'_, PyTuple>> {
-    let mut elements: Vec<Py<PyAny>> = vec![];
-    for col_idx in 0..column_count {
-        let libsql_value = row.get_value(col_idx).map_err(to_py_err)?;
-        let value = match libsql_value {
-            libsql_core::Value::Integer(v) => {
-                let value = v as i64;
-                value.into_pyobject(py).unwrap().into()
-            }
-            libsql_core::Value::Real(v) => v.into_pyobject(py).unwrap().into(),
-            libsql_core::Value::Text(v) => v.into_pyobject(py).unwrap().into(),
-            libsql_core::Value::Blob(v) => {
-                let value = v.as_slice();
-                value.into_pyobject(py).unwrap().into()
-            }
-            libsql_core::Value::Null => py.None(),
+fn convert_row(py: Python<'_>, row: Vec<libsql_core::Value>) -> PyResult<Bound<'_, PyTuple>> {
+    let mut elements: Vec<Bound<'_, PyAny>> = Vec::with_capacity(row.len());
+    for value in row {
+        let value = match value {
+            libsql_core::Value::Integer(v) => v.into_pyobject(py)?.into_any(),
+            libsql_core::Value::Real(v) => v.into_pyobject(py)?.into_any(),
+            libsql_core::Value::Text(v) => v.into_pyobject(py)?.into_any(),
+            libsql_core::Value::Blob(v) => PyBytes::new(py, &v).into_any(),
+            libsql_core::Value::Null => py.None().into_bound(py),
         };
         elements.push(value);
     }
-    Ok(PyTuple::new(py, elements)?)
+    PyTuple::new(py, elements)
+}
+
+fn convert_rows(py: Python<'_>, rows: Vec<Vec<libsql_core::Value>>) -> PyResult<Bound<'_, PyList>> {
+    let rows = rows
+        .into_iter()
+        .map(|row| convert_row(py, row))
+        .collect::<PyResult<Vec<_>>>()?;
+    PyList::new(py, rows)
 }
 
 create_exception!(libsql, Error, pyo3::exceptions::PyException);
 
-impl<'py> FromPyObject<'py> for ListOrTuple<'py> {
-    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-        if let Ok(list) = ob.downcast::<PyList>() {
-            Ok(ListOrTuple::List(list.clone()))
-        } else if let Ok(tuple) = ob.downcast::<PyTuple>() {
-            Ok(ListOrTuple::Tuple(tuple.clone()))
+impl<'a, 'py> FromPyObject<'a, 'py> for ListOrTuple<'py> {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
+        if let Ok(list) = ob.cast::<PyList>() {
+            Ok(ListOrTuple::List(list.to_owned()))
+        } else if let Ok(tuple) = ob.cast::<PyTuple>() {
+            Ok(ListOrTuple::Tuple(tuple.to_owned()))
         } else {
             Err(PyValueError::new_err(
                 "Expected a list or tuple for parameters",
@@ -751,6 +754,7 @@ impl<'py> Iterator for ListOrTupleIterator<'py> {
         })
     }
 }
+
 #[pymodule]
 fn libsql(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -762,21 +766,4 @@ fn libsql(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Connection>()?;
     m.add_class::<Cursor>()?;
     Ok(())
-}
-
-async fn check_signals<F, R>(py: Python<'_>, mut fut: std::pin::Pin<&mut F>) -> R
-where
-    F: std::future::Future<Output = R>,
-{
-    loop {
-        tokio::select! {
-            out = &mut fut => {
-                break out;
-            }
-
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                py.check_signals().unwrap();
-            }
-        }
-    }
 }

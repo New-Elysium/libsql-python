@@ -527,6 +527,45 @@ def test_context_manager_manual_transaction_control(provider):
     assert results == [(1,), (2,), (4,)]
 
 
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_large_integer_parameters(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    big = 2**40 + 1
+    conn.execute("INSERT INTO t VALUES (?)", (big,))
+    value = conn.execute("SELECT v FROM t").fetchone()[0]
+    assert value == big and isinstance(value, int)
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_fetch_after_exhaustion(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(1,), (2,)])
+    cur = conn.execute("SELECT v FROM t ORDER BY v")
+    assert cur.fetchall() == [(1,), (2,)]
+    assert cur.fetchone() is None
+    assert cur.fetchall() == []
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_cursor_reuse_after_exhaustion(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (v INTEGER)")
+    cur.executemany("INSERT INTO t VALUES (?)", [(1,), (2,)])
+    assert cur.execute("SELECT v FROM t ORDER BY v").fetchmany(5) == [(1,), (2,)]
+    assert cur.execute("SELECT v FROM t ORDER BY v").fetchmany(1) == [(1,)]
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_cursor_after_connection_close_raises(provider):
+    conn = connect(provider, ":memory:")
+    conn.close()
+    with pytest.raises(Exception):
+        conn.cursor().execute("SELECT 1")
+
+
 def connect(provider, database, timeout=5, isolation_level="DEFERRED", autocommit=-1):
     if provider == "libsql-remote":
         from urllib import request
