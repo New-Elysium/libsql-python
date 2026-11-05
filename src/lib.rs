@@ -74,12 +74,61 @@ where
     })
 }
 
+/// Map a libSQL error onto the DB-API exception hierarchy (the same classes
+/// the stdlib `sqlite3` module exposes). Remote/Hrana/replication failures
+/// are `OperationalError`s, which lets callers (e.g. SQLAlchemy) tell a dead
+/// connection from a bad query.
 fn to_py_err(error: libsql_core::errors::Error) -> PyErr {
-    let msg = match error {
-        libsql_core::Error::SqliteFailure(_, err) => err,
-        _ => error.to_string(),
-    };
-    PyValueError::new_err(msg)
+    use libsql_core::Error as E;
+
+    // Primary SQLite result codes, see https://sqlite.org/rescode.html
+    const SQLITE_MISUSE: i32 = 21;
+    const SQLITE_CONSTRAINT: i32 = 19;
+    const SQLITE_TOOBIG: i32 = 18;
+    const SQLITE_MISMATCH: i32 = 20;
+    const SQLITE_CORRUPT: i32 = 11;
+    const SQLITE_NOTADB: i32 = 26;
+
+    fn from_code(code: i32, msg: String) -> PyErr {
+        match code & 0xff {
+            SQLITE_CONSTRAINT => IntegrityError::new_err(msg),
+            SQLITE_TOOBIG | SQLITE_MISMATCH => DataError::new_err(msg),
+            SQLITE_MISUSE => ProgrammingError::new_err(msg),
+            SQLITE_CORRUPT | SQLITE_NOTADB => DatabaseError::new_err(msg),
+            _ => OperationalError::new_err(msg),
+        }
+    }
+
+    match error {
+        E::SqliteFailure(code, msg) => from_code(code, msg),
+        E::RemoteSqliteFailure(code, extended, msg) => {
+            from_code(if extended != 0 { extended } else { code }, msg)
+        }
+        E::Sqlite3SyntaxError(..) | E::Sqlite3UnsupportedStatement | E::Sqlite3ParserError(_) => {
+            ProgrammingError::new_err(error.to_string())
+        }
+        E::Misuse(_)
+        | E::ExecuteReturnedRows
+        | E::QueryReturnedNoRows
+        | E::InvalidColumnName(_)
+        | E::InvalidColumnIndex
+        | E::InvalidColumnType
+        | E::ColumnNotFound(_) => ProgrammingError::new_err(error.to_string()),
+        E::SyncNotSupported(_)
+        | E::LoadExtensionNotSupported
+        | E::AuthorizerNotSupported
+        | E::UpdateHookNotSupported
+        | E::FreezeNotSupported(_) => NotSupportedError::new_err(error.to_string()),
+        E::ConnectionFailed(_)
+        | E::Hrana(_)
+        | E::WriteDelegation(_)
+        | E::Replication(_)
+        | E::Sync(_)
+        | E::WalConflict
+        | E::InvalidTlsConfiguration(_)
+        | E::TransactionalBatchError(_) => OperationalError::new_err(error.to_string()),
+        _ => DatabaseError::new_err(error.to_string()),
+    }
 }
 
 fn is_remote_path(path: &str) -> bool {
@@ -87,6 +136,7 @@ fn is_remote_path(path: &str) -> bool {
 }
 
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(Py_3_12))]
 #[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, offline=false, auth_token="", encryption_key=None))]
 fn connect(
@@ -119,6 +169,7 @@ fn connect(
 }
 
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 #[cfg(Py_3_12)]
 #[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, offline=false, auth_token="", encryption_key=None, autocommit = LEGACY_TRANSACTION_CONTROL))]
 fn connect(
@@ -160,6 +211,7 @@ fn connect(
     Ok(conn)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn _connect_core(
     py: Python<'_>,
     database: String,
@@ -255,7 +307,7 @@ impl Drop for ConnectionGuard {
 }
 
 fn closed_err() -> PyErr {
-    PyValueError::new_err("Connection already closed")
+    ProgrammingError::new_err("Connection already closed")
 }
 
 #[pyclass]
@@ -712,7 +764,18 @@ fn convert_rows(py: Python<'_>, rows: Vec<Vec<libsql_core::Value>>) -> PyResult<
     PyList::new(py, rows)
 }
 
-create_exception!(libsql, Error, pyo3::exceptions::PyException);
+// DB-API exception hierarchy. `Error` derives from `ValueError` so that code
+// written against the previous behavior (everything was a `ValueError`) keeps
+// working.
+create_exception!(libsql, Error, PyValueError);
+create_exception!(libsql, InterfaceError, Error);
+create_exception!(libsql, DatabaseError, Error);
+create_exception!(libsql, DataError, DatabaseError);
+create_exception!(libsql, OperationalError, DatabaseError);
+create_exception!(libsql, IntegrityError, DatabaseError);
+create_exception!(libsql, InternalError, DatabaseError);
+create_exception!(libsql, ProgrammingError, DatabaseError);
+create_exception!(libsql, NotSupportedError, DatabaseError);
 
 impl<'a, 'py> FromPyObject<'a, 'py> for ListOrTuple<'py> {
     type Error = PyErr;
@@ -748,10 +811,9 @@ impl<'py> Iterator for ListOrTupleIterator<'py> {
             ListOrTuple::Tuple(tuple) => tuple.get_item(self.index),
         };
 
-        rv.ok().map(|item| {
-            self.index += 1;
-            item
-        })
+        let item = rv.ok()?;
+        self.index += 1;
+        Some(item)
     }
 }
 
@@ -762,6 +824,14 @@ fn libsql(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("paramstyle", "qmark")?;
     m.add("sqlite_version_info", (3, 42, 0))?;
     m.add("Error", py.get_type::<Error>())?;
+    m.add("InterfaceError", py.get_type::<InterfaceError>())?;
+    m.add("DatabaseError", py.get_type::<DatabaseError>())?;
+    m.add("DataError", py.get_type::<DataError>())?;
+    m.add("OperationalError", py.get_type::<OperationalError>())?;
+    m.add("IntegrityError", py.get_type::<IntegrityError>())?;
+    m.add("InternalError", py.get_type::<InternalError>())?;
+    m.add("ProgrammingError", py.get_type::<ProgrammingError>())?;
+    m.add("NotSupportedError", py.get_type::<NotSupportedError>())?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<Cursor>()?;

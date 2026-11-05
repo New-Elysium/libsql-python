@@ -10,7 +10,7 @@ Python SDK for [libSQL](https://turso.tech/libsql) (Turso). A PyO3/maturin nativ
 - `docs/api.md` — hand-written API reference (partly stale, e.g. says `executescript` is "Unimplemented" though it exists).
 - `examples/` — per-feature demos (local, memory, remote, sync, batch, transaction, vector, encryption, sqlalchemy), each with a README. `example.py`, `perf-libsql.py`, `perf-sqlite3.py` live in the root.
 - `RUST.md` — Rust/PyO3 best practices. **These are repo rules: follow them** (std `OnceLock`/`LazyLock` over `lazy_static`, `Mutex`/`RwLock` over `unsafe` Send/Sync, `Python::attach`/`detach`, `Bound`/`Py<PyAny>`, `IntoPyObject`, `if cfg!()` over `#[cfg]` where both branches can compile, explicit crate features, up-to-date maturin).
-- `.github/workflows/CI.yml` — builds wheels (linux/macOS/windows + sdist) with maturin-action; tags `v*` publish to PyPI. `pr-tests.yml` runs `maturin develop && pytest` on PRs to `main`.
+- `.github/workflows/CI.yml` — single workflow: builds wheels for linux (x86_64, i686, aarch64, armv7), macOS (x86_64, arm64) and Windows (x86_64, i686, arm64) × CPython 3.10–3.15 incl. free-threaded (`3.14t`, `3.15t`) + sdist; installs the built wheels and runs `tests/test_suite.py` on a native subset; tags `v*` publish to PyPI (token `PYPI_API_TOKEN` if set, otherwise trusted publishing, environment `pypi`). Runs on PRs, `main`, tags and `workflow_dispatch` (dispatch builds but never publishes). Modeled on `New-Elysium/thumbleweed`'s wheel workflow; keep action majors (`checkout@v6`, `setup-python@v6`, `upload-artifact@v7`, `download-artifact@v8`) and `MATURIN_VERSION` current.
 
 ## Commands
 
@@ -32,7 +32,8 @@ Remote tests (provider `"libsql-remote"`) need an `sqld` server on `http://local
 - `pyo3 0.30.1`, Rust edition **2024** (MSRV 1.85), `crate-type = ["cdylib"]`. Keep `pyo3` and `pyo3-build-config` on the same version. No `extension-module` feature: maturin sets `PYO3_BUILD_EXTENSION_MODULE`.
 - `libsql 0.10.0` with the `encryption` feature (the default features — core, replication, remote, sync, tls — are all used); `tokio` with explicit features `rt-multi-thread`, `time`, `macros` (all used directly; don't rely on libsql's feature unification); `tracing-subscriber` (initialized at import via `try_init`).
 - Version must be kept in sync in **both** `Cargo.toml` and `pyproject.toml` (currently 0.1.11). Dependency bumps and releases are separate commits in history ("Update libsql dependency", "0.1.x").
-- `pyproject.toml` still declares `requires-python >=3.7`, but PyO3 0.30 dropped Python 3.7/3.8 and CI builds with 3.10+; verify/raise before claiming support for old versions.
+- `requires-python >=3.10` (the project minimum; CI builds 3.10–3.15, no 3.13t since PyO3 0.30 dropped it).
+- `cargo audit` reports advisories in libsql 0.10.0's pinned transitive deps (`rustls 0.22`/`rustls-webpki 0.102`, `h2 0.3`, `bincode 1`, `rustls-pemfile`): they come from `hyper 0.14`/`tonic 0.11` inside libsql and can't be bumped from here — they need an upstream libsql release. Re-run `cargo audit` after each libsql bump.
 
 ## Architecture / how things work
 
@@ -43,8 +44,8 @@ Remote tests (provider `"libsql-remote"`) need an `sqld` server on `http://local
   - `sync_url` set → embedded replica via `Builder::new_synced_database` (`sync_interval`, `offline` → `remote_writes(!offline)`); `encryption_key` is rejected here.
   - Otherwise local file/`:memory:` via `Builder::new_local`, optional `EncryptionConfig` (default cipher).
   - Underscore-prefixed args (`_check_same_thread`, `_uri`) are accepted for sqlite3 compat and ignored. `timeout` → `busy_timeout`.
-- **`ConnectionGuard`** wraps `libsql::Connection` and enters the tokio runtime in `Drop` (hrana needs a runtime to spawn its close call). `Connection` and `Cursor` share it via `Arc`; closing a connection sets its `RefCell<Option<Arc<..>>>` to `None`.
-- **`Connection`/`Cursor`** are `#[pyclass]` types with `Mutex`/atomic interior state (free-threading safe, no `unsafe impl`); use the `lock()` helper (ignores poisoning). Don't hold a `MutexGuard` across `py.detach` — lock inside the detached closure (guards aren't `Send`). A closed connection/cursor raises `ValueError("Connection already closed")` (no panics).
+- **`ConnectionGuard`** wraps `libsql::Connection` and enters the tokio runtime in `Drop` (hrana needs a runtime to spawn its close call). `Connection` and `Cursor` share it via `Arc`; closing a connection sets its `Mutex<Option<Arc<..>>>` to `None`.
+- **`Connection`/`Cursor`** are `#[pyclass]` types with `Mutex`/atomic interior state (free-threading safe, no `unsafe impl`); use the `lock()` helper (ignores poisoning). Don't hold a `MutexGuard` across `py.detach` — lock inside the detached closure (guards aren't `Send`). A closed connection/cursor raises `ProgrammingError("Connection already closed")` (no panics).
 - **Transactions** emulate `sqlite3` legacy behavior in `execute()`: if not autocommit (`determine_autocommit`) and the statement is INSERT/UPDATE/DELETE (`stmt_is_dml`, prefix match on trimmed uppercased SQL) and the connection is in autocommit state, an implicit `BEGIN` is issued. `commit()`/`rollback()` run `COMMIT`/`ROLLBACK` only if a txn is open (a TODO notes switching to libsql's transaction API). `__exit__` commits on clean exit, rolls back on exception, never swallows exceptions.
 - **`execute()` flow:** convert params (attached) → detached `run_statement`: optional implicit `BEGIN`, `prepare`, then `query()` (statement has columns → store `Rows`) or `execute()` → reset `done`, accumulate `rowcount` (+= `changes()`) → store statement/rows under a tokio context (their drop may need it).
 - **Parameter conversion order:** None → `i64` → `f64` → `str` → `bytes`. Only positional (list/tuple) params; no named/dict params, no `bool`/`datetime`/adapter support.
@@ -53,7 +54,7 @@ Remote tests (provider `"libsql-remote"`) need an `sqld` server on `http://local
 
 ## Known quirks / gotchas (verify before relying on them)
 
-- All libsql errors are raised as `ValueError` (`to_py_err`), not the exported `libsql.Error` (which is defined but unused) and not `sqlite3`-style exception hierarchies.
+- Errors follow the DB-API/`sqlite3` hierarchy (`Error` → `DatabaseError` → `OperationalError`/`IntegrityError`/`ProgrammingError`/`DataError`/`InternalError`/`NotSupportedError`; `InterfaceError`), mapped in `to_py_err` from SQLite result codes and libsql error variants. Remote/Hrana/replication failures are `OperationalError` (so SQLAlchemy can detect dead Hrana streams). `Error` deliberately subclasses `ValueError` so old `except ValueError` code keeps working. Argument validation errors are still plain `ValueError`.
 - `Connection.executescript` discards errors (`let _ = ...`); `Cursor.executescript` propagates them.
 - `executemany` requires a list of parameters (raises `ValueError` otherwise) and runs statements one by one.
 - `docs/api.md` and README lag behind the code; update docs when adding user-visible behavior.

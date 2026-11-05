@@ -528,6 +528,26 @@ def test_context_manager_manual_transaction_control(provider):
 
 
 @pytest.mark.parametrize("provider", ["libsql", "sqlite"])
+def test_error_hierarchy(provider):
+    mod = libsql if provider == "libsql" else sqlite3
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    with pytest.raises(mod.IntegrityError):
+        conn.execute("INSERT INTO t VALUES (1)")
+    with pytest.raises(mod.OperationalError):
+        conn.execute("SELECT * FROM missing_table")
+    assert issubclass(mod.IntegrityError, mod.DatabaseError)
+    assert issubclass(mod.DatabaseError, mod.Error)
+
+
+def test_libsql_errors_are_still_value_errors():
+    conn = connect("libsql", ":memory:")
+    with pytest.raises(ValueError):
+        conn.execute("SELECT * FROM missing_table")
+
+
+@pytest.mark.parametrize("provider", ["libsql", "sqlite"])
 def test_large_integer_parameters(provider):
     conn = connect(provider, ":memory:")
     conn.execute("CREATE TABLE t (v INTEGER)")
