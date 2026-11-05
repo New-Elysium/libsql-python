@@ -9,6 +9,7 @@ Python SDK for [libSQL](https://turso.tech/libsql) (Turso). A PyO3/maturin nativ
 - `tests/test_suite.py` — pytest suite; most tests are parametrized over `["libsql", "sqlite"]` to assert behavioral parity with stdlib `sqlite3`.
 - `docs/api.md` — hand-written API reference (partly stale, e.g. says `executescript` is "Unimplemented" though it exists).
 - `examples/` — per-feature demos (local, memory, remote, sync, batch, transaction, vector, encryption, sqlalchemy), each with a README. `example.py`, `perf-libsql.py`, `perf-sqlite3.py` live in the root.
+- `libsql.pyi` — type stubs for the extension (maturin ships them as `libsql/__init__.pyi` + `py.typed`). **Update it whenever the Python-visible API in `src/lib.rs` changes.**
 - `RUST.md` — Rust/PyO3 best practices. **These are repo rules: follow them** (std `OnceLock`/`LazyLock` over `lazy_static`, `Mutex`/`RwLock` over `unsafe` Send/Sync, `Python::attach`/`detach`, `Bound`/`Py<PyAny>`, `IntoPyObject`, `if cfg!()` over `#[cfg]` where both branches can compile, explicit crate features, up-to-date maturin).
 - `.github/workflows/CI.yml` — single workflow: builds wheels for linux (x86_64, i686, aarch64, armv7), macOS (x86_64, arm64) and Windows (x86_64, i686, arm64) × CPython 3.10–3.15 (Windows ARM64 3.11+, no earlier CPython builds exist) incl. free-threaded (`3.14t`, `3.15t`) + sdist; installs the built wheels and runs `tests/test_suite.py` on a native subset; tags `v*` publish to PyPI (token `PYPI_API_TOKEN` if set, otherwise trusted publishing, environment `pypi`). Runs on PRs, `main`, tags and `workflow_dispatch` (dispatch builds but never publishes). Modeled on `New-Elysium/thumbleweed`'s wheel workflow; keep action majors (`checkout@v6`, `setup-python@v6`, `upload-artifact@v7`, `download-artifact@v8`) and `MATURIN_VERSION` current.
 
@@ -63,6 +64,7 @@ Remote tests (provider `"libsql-remote"`) need an `sqld` server on `http://local
 ## Conventions
 
 - Keep the DB-API surface mirroring stdlib `sqlite3`; when adding behavior, add a test parametrized over `["libsql", "sqlite"]` so parity is checked.
-- Run `cargo fmt` and `cargo clippy` before committing (no repo config; defaults are used).
+- Before committing run `cargo fmt`, `cargo clippy -- -D warnings`, `ruff check .`, `ruff format --check .` and `ty check .` (all enforced by the CI `lint` job; ruff config lives in `pyproject.toml`). Examples must type-check too, so read required env vars with `os.environ[...]` and default tokens to `""` (the driver takes `str`, not `None`).
 - Don't commit `*.db`, `client_wal_index`, `target/`, `.env`, venvs (see `.gitignore`).
 - Don't push to or release from `main` by hand: releases are tags `v*` handled by CI with `PYPI_API_TOKEN`.
+- Pre-commit: `.pre-commit-config.yaml` runs the same checks (`pip install pre-commit && pre-commit install`).

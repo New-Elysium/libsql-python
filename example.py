@@ -1,7 +1,6 @@
 import libsql
 
-con = libsql.connect("hello.db", sync_url="http://localhost:8080",
-                                  auth_token="")
+con = libsql.connect("hello.db", sync_url="http://localhost:8080", auth_token="")
 
 con.sync()
 
