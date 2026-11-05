@@ -634,7 +634,8 @@ def test_isolation_level_is_writable(provider):
     conn = connect(provider, ":memory:")
     assert conn.isolation_level == "DEFERRED"
     conn.isolation_level = "immediate"
-    assert conn.isolation_level == "IMMEDIATE"
+    # sqlite3 stores it uppercased only on Python 3.11+; libsql always does.
+    assert conn.isolation_level.upper() == "IMMEDIATE"
     conn.isolation_level = None
     assert conn.isolation_level is None
     with pytest.raises(ValueError):
