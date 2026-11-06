@@ -77,7 +77,7 @@ jobs:
           - os: macos-15-intel
             platform: macos-x86_64
             target: x86_64-apple-darwin
-          - os: macos-26
+          - os: macos-15
             platform: macos-aarch64
             target: aarch64-apple-darwin
             arch: arm64
@@ -140,7 +140,7 @@ jobs:
 
       - name: Set up QEMU
         if: runner.os == 'Linux' && matrix.target == 'armv7'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: linux/arm/v7
 
@@ -204,10 +204,10 @@ jobs:
           - os: macos-15-intel
             platform: macos-x86_64
             python-version: "3.12"
-          - os: macos-26
+          - os: macos-15
             platform: macos-aarch64
             python-version: "3.12"
-          - os: macos-26
+          - os: macos-15
             platform: macos-aarch64
             python-version: "3.14t"
           - os: windows-latest
@@ -248,13 +248,14 @@ jobs:
           python -m pytest -v test_suite.py
 
   release:
-    name: Publish to PyPI
+    name: Publish to PyPI and GitHub
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [lint, build, sdist, test]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -276,3 +277,10 @@ jobs:
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          # Attach every wheel + the sdist to the release page.
+          files: dist/*
+          generate_release_notes: true
