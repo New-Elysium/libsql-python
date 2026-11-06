@@ -1,6 +1,6 @@
 # CLAUDE.md — libsql-python
 
-Python SDK for [libSQL](https://turso.tech/libsql) (Turso). A PyO3/maturin native extension exposing a `sqlite3`-compatible DB-API. Published to PyPI as **`libsql`** (Cargo crate name: `pylibsql`, Rust lib/module name: `libsql`).
+Python SDK for [libSQL](https://turso.tech/libsql) (Turso). A PyO3/maturin native extension exposing a `sqlite3`-compatible DB-API. Published to PyPI as **`libsql-py`** (Cargo crate name and importable module: `libsql`; only the PyPI distribution name differs — drop-in replacement). Upstream: https://github.com/New-Elysium/libsql-python.
 
 ## Layout
 
@@ -32,7 +32,7 @@ Remote tests (provider `"libsql-remote"`) need an `sqld` server on `http://local
 
 - `pyo3 0.30.1`, Rust edition **2024** (MSRV 1.85), `crate-type = ["cdylib"]`. Keep `pyo3` and `pyo3-build-config` on the same version. No `extension-module` feature: maturin sets `PYO3_BUILD_EXTENSION_MODULE`.
 - `libsql 0.10.0` with the `encryption` feature (the default features — core, replication, remote, sync, tls — are all used); `tokio` with explicit features `rt-multi-thread`, `time`, `macros` (all used directly; don't rely on libsql's feature unification); `tracing-subscriber` (initialized at import via `try_init`).
-- Version must be kept in sync in **both** `Cargo.toml` and `pyproject.toml` (currently 0.1.11). Dependency bumps and releases are separate commits in history ("Update libsql dependency", "0.1.x").
+- Version must be kept in sync in **both** `Cargo.toml` and `pyproject.toml` (currently 1.0.0). Dependency bumps and releases are separate commits in history ("Update libsql dependency", "0.1.x").
 - `requires-python >=3.10` (the project minimum; CI builds 3.10–3.15, no 3.13t since PyO3 0.30 dropped it).
 - `cargo audit` reports advisories in libsql 0.10.0's pinned transitive deps (`rustls 0.22`/`rustls-webpki 0.102`, `h2 0.3`, `bincode 1`, `rustls-pemfile`): they come from `hyper 0.14`/`tonic 0.11` inside libsql and can't be bumped from here — they need an upstream libsql release. Re-run `cargo audit` after each libsql bump.
 

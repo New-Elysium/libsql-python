@@ -5,7 +5,7 @@ This example demonstrates how to use libSQL with a local SQLite file.
 ## Install Dependencies
 
 ```bash
-pip install libsql
+pip install libsql-py
 ```
 
 ## Running

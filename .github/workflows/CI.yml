@@ -235,7 +235,7 @@ jobs:
       - name: Install the built wheel and test dependencies
         run: |
           python -m pip install --upgrade pip pytest
-          python -m pip install libsql --no-index --find-links dist --force-reinstall
+          python -m pip install libsql-py --no-index --find-links dist --force-reinstall
 
       # The wheel must be tested, not the checkout: run from a clean directory
       # so the installed extension module is the one that gets imported.

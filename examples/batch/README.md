@@ -5,7 +5,7 @@ This example demonstrates how to use libSQL to execute a batch of SQL statements
 ## Install Dependencies
 
 ```bash
-pip install libsql
+pip install libsql-py
 ```
 
 ## Running

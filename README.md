@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://docs.turso.tech/sdk/python/quickstart">
+  <a href="https://github.com/New-Elysium/libsql-python">
     <img alt="Turso + Python" src="https://github.com/tursodatabase/libsql-python/assets/950181/3748f2b3-872e-4cdd-bbe3-78491fd81dfa" width="1000">
     <h3 align="center">Turso + Python</h3>
   </a>
@@ -14,20 +14,44 @@
   <a href="https://docs.turso.tech/quickstart"><strong>Quickstart</strong></a> ·
   <a href="/examples"><strong>Examples</strong></a> ·
   <a href="https://docs.turso.tech"><strong>Docs</strong></a> ·
+  <a href="https://github.com/New-Elysium/libsql-python"><strong>GitHub</strong></a> ·
   <a href="https://discord.gg/turso"><strong>Discord</strong></a> ·
   <a href="https://blog.turso.tech/"><strong>Blog &amp; Tutorials</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/libsql">
-    <img src="https://badge.fury.io/py/libsql.svg" alt="PyPI" title="PyPI" />
-  </a>
-  <a href="https://discord.com/invite/4B5D7hYwub">
-    <img src="https://dcbadge.vercel.app/api/server/4B5D7hYwub?style=flat" alt="discord activity" title="join us on discord" />
+  <a href="https://pypi.org/project/libsql-py">
+    <img src="https://badge.fury.io/py/libsql-py.svg" alt="PyPI" title="PyPI" />
   </a>
 </p>
 
 ---
+
+## Installation
+
+The package is published to PyPI as **[`libsql-py`](https://pypi.org/project/libsql-py)**:
+
+```sh
+pip install libsql-py
+```
+
+The importable module stays **`libsql`**, so it is a drop-in replacement — any code, tutorial, or documentation written against `import libsql` keeps working unchanged:
+
+```python
+import libsql
+
+conn = libsql.connect("local.db")
+conn.execute("CREATE TABLE users (id INTEGER, email TEXT)")
+conn.execute("INSERT INTO users VALUES (1, 'alice@example.com')")
+print(conn.execute("SELECT * FROM users").fetchall())
+```
+
+> [!NOTE]
+> If the original [`libsql`](https://pypi.org/project/libsql) distribution is installed, uninstall it first (`pip uninstall libsql`). Both distributions provide the same `libsql` module, and having both installed would leave the import target ambiguous.
+
+## Source Code
+
+Upstream repository: [New-Elysium/libsql-python](https://github.com/New-Elysium/libsql-python)
 
 ## Documentation
 

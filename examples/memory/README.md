@@ -5,7 +5,7 @@ This example demonstrates how to use libSQL with an in-memory SQLite database.
 ## Install Dependencies
 
 ```bash
-pip install libsql
+pip install libsql-py
 ```
 
 ## Running

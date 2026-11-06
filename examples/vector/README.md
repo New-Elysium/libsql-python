@@ -5,7 +5,7 @@ This example demonstrates how to use libSQL vector search with a local database.
 ## Install Dependencies
 
 ```bash
-pip install libsql
+pip install libsql-py
 ```
 
 ## Running
