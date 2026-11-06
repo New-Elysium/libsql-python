@@ -74,10 +74,10 @@ jobs:
             target: armv7
             manylinux: auto
           # ── macOS ────────────────────────────────────────────────────────
-          - os: macos-15-intel
+          - os: macos-latest-intel
             platform: macos-x86_64
             target: x86_64-apple-darwin
-          - os: macos-14
+          - os: macos-latest
             platform: macos-aarch64
             target: aarch64-apple-darwin
             arch: arm64
@@ -201,13 +201,13 @@ jobs:
           - os: ubuntu-26.04-arm
             platform: linux-aarch64
             python-version: "3.12"
-          - os: macos-15-intel
+          - os: macos-latest-intel
             platform: macos-x86_64
             python-version: "3.12"
-          - os: macos-14
+          - os: macos-latest
             platform: macos-aarch64
             python-version: "3.12"
-          - os: macos-14
+          - os: macos-latest
             platform: macos-aarch64
             python-version: "3.14t"
           - os: windows-latest
